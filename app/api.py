@@ -24,6 +24,9 @@ class SubmitBody(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     max_retries: int = 0
     lease_timeout_ms: int = 5000
+    group: str = "default"
+    retry_delay_ms: int = 0
+    retry_backoff_multiplier: float = 1.0
 
 
 def task_to_dto(task: Task) -> dict[str, Any]:
@@ -32,13 +35,16 @@ def task_to_dto(task: Task) -> dict[str, Any]:
         "idempotency_key": task.idempotency_key,
         "state": task.state.value,
         "priority": task.priority,
+        "group": task.group,
         "dependencies": sorted(task.dependencies),
         "attempts": task.attempts,
+        "max_retries": task.max_retries,
         "submit_count": task.submit_count,
         "failure_reason": task.failure_reason,
         "failure_detail": task.failure_detail,
         "lease_owner": task.lease_owner,
         "lease_expire_at_ms": task.lease_expire_at_ms,
+        "next_retry_at_ms": task.next_retry_at_ms,
         "created_at_ms": task.created_at_ms,
         "updated_at_ms": task.updated_at_ms,
         "events": list(task.events),
@@ -84,6 +90,9 @@ def create_app(service: OrchestrationService | None = None) -> FastAPI:
             dependencies=frozenset(body.dependencies),
             max_retries=body.max_retries,
             lease_timeout_ms=body.lease_timeout_ms,
+            group=body.group,
+            retry_delay_ms=body.retry_delay_ms,
+            retry_backoff_multiplier=body.retry_backoff_multiplier,
         )
         task = svc.submit(spec)
         return task_to_dto(task)

@@ -32,12 +32,17 @@ class OrchestrationService:
         self,
         max_concurrency: int = 1,
         clock: Clock | None = None,
+        group_limits: dict[str, int] | None = None,
     ) -> None:
         self.clock = clock or SystemClock()
         self.store = TaskStore()
         self.executor = Executor(self.store, self.clock)
         self.scheduler = Scheduler(
-            self.store, self.clock, max_concurrency, executor=self.executor
+            self.store,
+            self.clock,
+            max_concurrency,
+            executor=self.executor,
+            group_limits=group_limits,
         )
 
     # ---------- 提交 ----------
@@ -70,6 +75,9 @@ class OrchestrationService:
                 dependencies=frozenset(spec.dependencies),
                 max_retries=spec.max_retries,
                 lease_timeout_ms=spec.lease_timeout_ms,
+                group=spec.group,
+                retry_delay_ms=spec.retry_delay_ms,
+                retry_backoff_multiplier=spec.retry_backoff_multiplier,
                 created_at_ms=now,
                 updated_at_ms=now,
             )
@@ -118,13 +126,24 @@ class OrchestrationService:
                     reason="already_failed",
                 )
             if task.state is TaskState.RUNNING:
-                # 运行中的任务由执行者结算；取消请求拒绝，避免执行者失联前的双写竞争。
-                raise InvalidStateTransitionError(
-                    task_id, task.state.value, TaskState.CANCELLED.value,
-                    reason="task_running",
+                # 运行中取消：立即作废租约、释放并发名额。
+                # 租约一旦清除，原执行者之后的心跳/成功/失败上报都会因
+                # owner_mismatch / not_running 被拒绝，状态不会被拉回。
+                old_owner = task.lease_owner
+                task.lease_owner = None
+                task.lease_expire_at_ms = None
+                task.next_retry_at_ms = None
+                transit(
+                    task, TaskState.CANCELLED, now_ms=self.clock.now_ms(),
+                    reason="cancel_requested_while_running",
                 )
+                logger.info(
+                    "运行中任务被取消 id=%s 作废租约 owner=%s", task.id, old_owner
+                )
+                return task
 
             # PENDING / BLOCKED / READY / LOST / FAILED_RETRYING 允许取消。
+            task.next_retry_at_ms = None
             transit(task, TaskState.CANCELLED, now_ms=self.clock.now_ms(), reason="cancel_requested")
             logger.info("任务取消 id=%s state=%s", task.id, task.state.value)
             return task

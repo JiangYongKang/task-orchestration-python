@@ -5,6 +5,8 @@
   失联执行者的迟到心跳 / succeed / fail 全部被拒绝（owner_mismatch / lease_lost），
   因此重试与重新调度不会造成重复结算或状态回退。
 - succeed / fail 只能在 RUNNING 状态结算一次；终态任务再次结算被拒绝。
+- 租约即使尚未被调度器回收，只要已过 lease_expire_at_ms，原执行者的
+  心跳 / succeed / fail 同样被拒绝（lease_expired），必须等回收方重新接管。
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import uuid
 
 from app.errors import InvalidStateTransitionError, TaskNotFoundError
 from app.clock import Clock, SystemClock
-from app.models import Task, TaskState, transit
+from app.models import Task, TaskState, retry_delay_for, transit
 from app.storage import TaskStore
 
 logger = logging.getLogger("orchestration")
@@ -52,7 +54,7 @@ class Executor:
             return token
 
     def heartbeat(self, task_id: str, owner: str) -> bool:
-        """心跳续约：仅当前租约持有者可续约；返回是否成功。"""
+        """心跳续约：仅当前租约持有者且租约未过期可续约；返回是否成功。"""
         with self.store.lock():
             task = self.store.get(task_id)
             if task is None:
@@ -65,9 +67,20 @@ class Executor:
                     "心跳拒绝 task=%s state=%s reason=not_running", task_id, task.state.value
                 )
                 return False
+            if self._lease_expired(task):
+                # 凭证已过期但调度器尚未回收：续命不算数，等回收方重新接管。
+                logger.warning(
+                    "心跳拒绝 task=%s owner=%s reason=lease_expired expire_at=%s",
+                    task_id, owner, task.lease_expire_at_ms,
+                )
+                return False
             task.lease_expire_at_ms = self.clock.now_ms() + task.lease_timeout_ms
             task.updated_at_ms = self.clock.now_ms()
             return True
+
+    def _lease_expired(self, task: Task) -> bool:
+        expire = task.lease_expire_at_ms
+        return expire is not None and self.clock.now_ms() >= expire
 
     def _require_running_owner(self, task_id: str, owner: str) -> Task:
         task = self.store.get(task_id)
@@ -91,6 +104,11 @@ class Executor:
             raise InvalidStateTransitionError(
                 task_id, task.state.value, "*", reason="lease_owner_mismatch"
             )
+        if self._lease_expired(task):
+            # 凭证已过期、调度器尚未回收：补交的上报不算数。
+            raise InvalidStateTransitionError(
+                task_id, task.state.value, "*", reason="lease_expired"
+            )
         return task
 
     def succeed(self, task_id: str, owner: str) -> None:
@@ -112,6 +130,8 @@ class Executor:
             task.lease_owner = None
             task.lease_expire_at_ms = None
             if remaining > 0:
+                delay = retry_delay_for(task)
+                task.next_retry_at_ms = now + delay
                 transit(
                     task,
                     TaskState.FAILED_RETRYING,
@@ -121,8 +141,9 @@ class Executor:
                     failure_detail=detail,
                 )
                 logger.info(
-                    "任务失败待重试 task=%s attempt=%d remaining=%d detail=%s",
-                    task_id, task.attempts, remaining, detail,
+                    "任务失败待重试 task=%s attempt=%d remaining=%d "
+                    "next_retry_at=%d(delay=%d) detail=%s",
+                    task_id, task.attempts, remaining, task.next_retry_at_ms, delay, detail,
                 )
             else:
                 transit(
