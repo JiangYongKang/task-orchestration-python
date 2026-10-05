@@ -44,6 +44,9 @@ class TaskSpec:
     dependencies: frozenset[str] = frozenset()
     max_retries: int = 0
     lease_timeout_ms: int = 5_000
+    group: str = "default"                  # 业务分组：受分组并发上限约束
+    retry_delay_ms: int = 0                 # 重试基础等待时间；0 表示立即重试
+    retry_backoff_multiplier: float = 1.0   # 退避倍率：第 n 次重试等待 delay * multiplier^(n-1)
 
 
 @dataclass
@@ -57,6 +60,9 @@ class Task:
     dependencies: frozenset[str]
     max_retries: int
     lease_timeout_ms: int
+    group: str = "default"
+    retry_delay_ms: int = 0
+    retry_backoff_multiplier: float = 1.0
     state: TaskState = TaskState.PENDING
     attempts: int = 0
     submit_count: int = 1
@@ -64,6 +70,7 @@ class Task:
     failure_detail: str | None = None
     lease_owner: str | None = None
     lease_expire_at_ms: int | None = None
+    next_retry_at_ms: int | None = None    # 下次允许重试的最早时间；None 表示无需等待
     created_at_ms: int = 0
     updated_at_ms: int = 0
     events: list[str] = field(default_factory=list)
@@ -71,6 +78,13 @@ class Task:
     @staticmethod
     def new_id() -> str:
         return uuid.uuid4().hex
+
+    def retry_wait_ms(self) -> int:
+        """本次（第 attempts 次执行后的）重试等待时长，按重试次数递增退避。"""
+        if self.retry_delay_ms <= 0:
+            return 0
+        exponent = max(0, self.attempts - 1)
+        return int(self.retry_delay_ms * (self.retry_backoff_multiplier ** exponent))
 
 
 # 合法状态跃迁表；任何不在表内的跃迁必须被拒绝。

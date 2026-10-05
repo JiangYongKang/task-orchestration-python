@@ -1,15 +1,19 @@
-"""调度器：依赖就绪判定、优先级排序、并发配额、租约回收与失败传播。
+"""调度器：依赖就绪判定、优先级排序、并发配额、租约回收、重试退避与失败传播。
 
-每轮 run_once 在 store 全局锁内原子执行四个阶段：
+每轮 run_once 在 store 全局锁内原子执行五个阶段：
 1. lease_reclaim   : RUNNING 中租约到期的任务 -> LOST -> READY/FAILED(重试耗尽)
 2. propagate       : 依赖出现 FAILED/CANCELLED 的未决任务 -> FAILED（级联）
 3. classify        : PENDING/BLOCKED 任务按依赖状态 -> READY 或保持 BLOCKED
-4. dispatch        : READY 任务按 (优先级降序, 创建时间升序) 派发，受并发上限约束
+4. retry_release   : FAILED_RETRYING / 等待重试的 LOST 任务，到达 next_retry_at_ms 才回 READY
+5. dispatch        : READY 任务按 (优先级降序, 创建时间升序) 派发，
+                     同时受全局并发上限与分组并发上限约束
 
 一致性保证：
 - 派发与 lease_granted 同锁完成，因此同一任务在并发调度下只会获得一次执行权；
 - 依赖失败/取消的下游直接判 FAILED（reason=upstream_failed），不会继续排队；
-- LOST 任务重试次数沿用 attempts 计数，不做重复结算。
+- 重试必须等到 next_retry_at_ms 之后才会重新参与调度；到点后本轮即回 READY，
+  保证「配了几次重试就实实在在执行几次」，不会出现只标记等待却不再执行；
+- 任何时刻 RUNNING 总数不超过全局上限，且每个分组在跑数不超过其分组上限。
 """
 
 from __future__ import annotations
@@ -37,13 +41,23 @@ class Scheduler:
         clock: Clock | None = None,
         max_concurrency: int = 1,
         executor: Executor | None = None,
+        group_limits: dict[str, int] | None = None,
     ) -> None:
         self.store = store
         self.clock = clock or SystemClock()
         self.max_concurrency = max(1, max_concurrency)
         self.executor = executor
+        # 分组并发上限：group -> 最大同时在跑数；未配置的分组只受全局上限约束。
+        self.group_limits: dict[str, int] = dict(group_limits or {})
         # 进程级派发串行化：即便多线程同时触发 run_once，也只能一轮轮进入。
         self._dispatch_lock = threading.Lock()
+
+    def set_group_limit(self, group: str, limit: int) -> None:
+        """设置/更新某个分组的并发上限（limit 必须 >= 1）。"""
+        if limit < 1:
+            raise ValueError(f"分组并发上限必须 >= 1: group={group} limit={limit}")
+        self.group_limits[group] = limit
+        logger.info("分组并发上限设置 group=%s limit=%d", group, limit)
 
     def run_once(self) -> list[str]:
         with self._dispatch_lock:
@@ -52,6 +66,7 @@ class Scheduler:
                 self._reclaim_leases(now)
                 self._propagate_failures(now)
                 self._classify(now)
+                self._release_retries(now)
                 return self._dispatch(now)
 
     # ---------- 阶段 1：租约回收 ----------
@@ -75,8 +90,17 @@ class Scheduler:
             # attempts = 已执行次数；仍有重试额度才重新排队。
             remaining = task.max_retries - (task.attempts - 1)
             if remaining > 0:
-                transit(task, TaskState.READY, now_ms=now, reason="lease_lost_requeue")
-                logger.info("失联任务重新排队 task=%s remaining=%d", task.id, remaining)
+                # 与执行失败一致：重试前需要等待退避时间，到点由 retry_release 阶段放行。
+                wait_ms = task.retry_wait_ms()
+                task.next_retry_at_ms = now + wait_ms
+                if wait_ms <= 0:
+                    transit(task, TaskState.READY, now_ms=now, reason="lease_lost_requeue")
+                    logger.info("失联任务重新排队 task=%s remaining=%d", task.id, remaining)
+                else:
+                    logger.info(
+                        "失联任务等待重试 task=%s remaining=%d wait_ms=%d next_retry_at=%d",
+                        task.id, remaining, wait_ms, task.next_retry_at_ms,
+                    )
             else:
                 transit(
                     task, TaskState.FAILED, now_ms=now,
@@ -141,7 +165,34 @@ class Scheduler:
             elif task.state is TaskState.PENDING:
                 transit(task, TaskState.BLOCKED, now_ms=now, reason="waiting_dependencies")
 
-    # ---------- 阶段 4：配额 + 优先级派发 ----------
+    # ---------- 阶段 4：重试退避放行 ----------
+    def _release_retries(self, now: int) -> None:
+        """到达 next_retry_at_ms 的等待重试任务回到 READY，本轮即可参与派发。
+
+        覆盖两种等待形态：
+        - FAILED_RETRYING：执行失败结算时写入 next_retry_at_ms；
+        - LOST（仍有额度）：租约回收时写入 next_retry_at_ms，等退避到点。
+        """
+        for task in self.store.all():
+            if task.state is TaskState.FAILED_RETRYING:
+                due = task.next_retry_at_ms
+            elif task.state is TaskState.LOST and task.next_retry_at_ms is not None:
+                due = task.next_retry_at_ms
+            else:
+                continue
+            if due is None or now < due:
+                logger.info(
+                    "重试未到点 task=%s state=%s next_retry_at=%s now=%d -> 本轮不调度",
+                    task.id, task.state.value, due, now,
+                )
+                continue
+            transit(task, TaskState.READY, now_ms=now, reason="retry_due")
+            logger.info(
+                "重试到点放行 task=%s attempt=%d next_retry_at=%s now=%d",
+                task.id, task.attempts, due, now,
+            )
+
+    # ---------- 阶段 5：配额 + 优先级派发 ----------
     def _dispatch(self, now: int) -> list[str]:
         running = sum(
             1 for t in self.store.all() if t.state is TaskState.RUNNING
@@ -151,25 +202,40 @@ class Scheduler:
             logger.info("配额已满 running=%d limit=%d -> 本轮不派发", running, self.max_concurrency)
             return []
 
+        # 各分组当前在跑数：分组上限与全局上限同时约束派发。
+        group_running: dict[str, int] = {}
+        for t in self.store.all():
+            if t.state is TaskState.RUNNING:
+                group_running[t.group] = group_running.get(t.group, 0) + 1
+
         ready = self.store.by_state(TaskState.READY)
         # 优先级高者先跑；同优先级按创建时间（再按 id 兜底）保证可复现顺序。
+        # 分组之间公平地按这个统一顺序抢名额：分组满了只跳过该组任务，不阻塞其它分组。
         ready.sort(key=lambda t: (-t.priority, t.created_at_ms, t.id))
 
         dispatched: list[str] = []
         for task in ready:
             if slots <= 0:
                 break
+            group_limit = self.group_limits.get(task.group)
+            if group_limit is not None and group_running.get(task.group, 0) >= group_limit:
+                logger.info(
+                    "分组配额已满 task=%s group=%s running=%d limit=%d -> 跳过该任务",
+                    task.id, task.group, group_running.get(task.group, 0), group_limit,
+                )
+                continue
             transit(task, TaskState.RUNNING, now_ms=now, reason="scheduler_dispatch")
             owner = None
             if self.executor is not None:
                 owner = self.executor.start(task.id)
             task.events.append(
-                f"{now}: dispatch order_priority={task.priority} owner={owner}"
+                f"{now}: dispatch order_priority={task.priority} group={task.group} owner={owner}"
             )
             dispatched.append(task.id)
             slots -= 1
+            group_running[task.group] = group_running.get(task.group, 0) + 1
             logger.info(
-                "派发任务 task=%s priority=%d owner=%s 剩余配额=%d",
-                task.id, task.priority, owner, slots,
+                "派发任务 task=%s priority=%d group=%s owner=%s 剩余全局配额=%d",
+                task.id, task.priority, task.group, owner, slots,
             )
         return dispatched
